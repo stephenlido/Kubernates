@@ -1,0 +1,160 @@
+# 🧭 From YAML to Running Pod in Kubernetes
+
+This document explains how a simple YAML manifest becomes a running Pod in Kubernetes, visualizing the internal components involved.
+
+---
+
+## Example YAML
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+```
+
+---
+
+## 🔹 Step 1 — You Apply the YAML
+
+```bash
+kubectl apply -f nginx-deployment.yaml
+```
+
+`kubectl`:
+
+* Reads your YAML file.
+* Converts it to JSON (since Kubernetes API speaks JSON).
+* Authenticates using your kubeconfig.
+* Sends a REST call to the API server:
+
+  ```
+  POST /apis/apps/v1/namespaces/default/deployments
+  ```
+
+---
+
+## ⚙️ Step 2 — API Server (The Heart)
+
+The **kube-apiserver** receives the JSON request.
+
+It:
+
+* Validates fields (`apiVersion`, `kind`, `spec`, etc.).
+* Checks your RBAC permissions.
+* Stores the object in **etcd** — Kubernetes' key-value database.
+
+📦 etcd now contains your **desired state** for this Deployment.
+
+---
+
+## 🔁 Step 3 — Controllers Start Working
+
+The **Deployment Controller** (part of the `kube-controller-manager`) sees a new Deployment and:
+
+* Creates a **ReplicaSet**.
+* That ReplicaSet creates **3 Pods** with matching labels.
+
+All these objects are stored in etcd as well.
+
+---
+
+## ⚙️ Step 4 — Scheduler Assigns Pods
+
+The **kube-scheduler** watches for unscheduled Pods and assigns them to nodes based on:
+
+* CPU/memory availability.
+* Node selectors or taints/tolerations.
+
+Once assigned, it updates each Pod spec with the chosen `nodeName`.
+
+---
+
+## 🧱 Step 5 — Kubelet Pulls the Image & Starts Containers
+
+On the assigned node:
+
+* **kubelet** detects the new Pod.
+* It instructs the **container runtime** (containerd/Docker) to:
+
+  * Pull the specified image (`nginx:latest`).
+  * Start the container.
+  * Expose the declared ports.
+
+At this point, your Pod is running.
+
+---
+
+## 🔍 Step 6 — Continuous Reconciliation
+
+Kubernetes continuously compares:
+
+* **Desired State** (in etcd)
+* **Actual State** (reported by kubelets)
+
+If a Pod crashes or node fails, controllers automatically recreate or move Pods until the desired and actual states match again.
+
+---
+
+## 📊 Architecture Flow Diagram (Text Representation)
+
+```
+Your YAML
+   │
+   ▼
+kubectl apply
+   │ (REST JSON)
+   ▼
+kube-apiserver
+   │
+   ▼
+etcd  ←── (stores desired state)
+   │
+   ▼
+Controller Manager (creates ReplicaSets, Pods)
+   │
+   ▼
+Scheduler (assigns Pods to Nodes)
+   │
+   ▼
+Kubelet on Node
+   │
+   ▼
+Container Runtime (runs containers)
+```
+
+---
+
+## 💬 Recap
+
+| Step | Component               | What It Does                              |
+| ---- | ----------------------- | ----------------------------------------- |
+| 1    | **kubectl**             | Sends YAML to the API server              |
+| 2    | **API Server**          | Validates and stores config in etcd       |
+| 3    | **Controller Manager**  | Creates ReplicaSets and Pods              |
+| 4    | **Scheduler**           | Assigns Pods to nodes                     |
+| 5    | **Kubelet**             | Runs containers on the node               |
+| 6    | **Reconciliation Loop** | Keeps actual state matching desired state |
+
+---
+
+## ✅ Summary
+
+Every YAML manifest in Kubernetes is a **declaration of desired state**. The control plane components work together in a feedback loop to ensure that the actual cluster state always matches that desired declaration.
+
+> Kubernetes = Declarative + Self-Healing + Automated
