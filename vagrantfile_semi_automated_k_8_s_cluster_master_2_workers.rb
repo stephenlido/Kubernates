@@ -1,0 +1,136 @@
+# Vagrantfile — Semi-automated Kubernetes cluster (master + 2 workers)
+# - Installs containerd + kubeadm/kubelet/kubectl on all nodes
+# - Does NOT auto-run `kubeadm init` or `kubeadm join` (you run those manually)
+# - Provides helper script on the master to run kubeadm init and emit a join command
+# - Uses Ubuntu 22.04 (jammy) base box
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+
+  # Common VirtualBox provider settings
+  config.vm.provider "virtualbox" do |vb|
+    vb.cpus = 2
+    vb.memory = 3072
+    # Ensure host-only nic (adapter 2) allows promiscuous traffic
+    vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+  end
+
+  # Common provisioning script (installs containerd + kube tools)
+  common_provision = <<-SHELL
+#!/bin/bash -eux
+# Common provisioning for master and workers
+#  - disable swap
+#  - load kernel modules and sysctl
+#  - install containerd (configured for systemd cgroup)
+#  - install kubeadm, kubelet, kubectl (kubeadm/kubelet on workers and master)
+
+# disable swap
+sudo swapoff -a
+sudo sed -i '/ swap / s/^/#/' /etc/fstab || true
+
+# modules
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+sudo modprobe overlay || true
+sudo modprobe br_netfilter || true
+
+# sysctl
+cat <<EOF | sudo tee /etc/sysctl.d/99-k8s.conf
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+sudo sysctl --system
+
+# install prerequisites
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+
+# install containerd
+sudo apt-get install -y containerd
+sudo mkdir -p /etc/containerd
+sudo containerd config default | sudo tee /etc/containerd/config.toml
+# ensure systemd cgroup driver
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml || true
+# ensure recommended pause image
+sudo sed -i 's@registry.k8s.io/pause:3.8@registry.k8s.io/pause:3.9@g' /etc/containerd/config.toml || true
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+
+# install kubernetes packages (kubelet, kubeadm, kubectl)
+# using v1.30 stable apt repo
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl || true
+sudo apt-mark hold kubelet kubeadm kubectl || true
+
+# create helper directories and permissions required by some CNI components
+sudo mkdir -p /opt/cni/bin /etc/cni/net.d /var/lib/cni/networks /var/lib/calico /var/run/calico
+sudo chown root:root /opt/cni/bin /etc/cni/net.d /var/lib/cni/networks /var/lib/calico /var/run/calico
+sudo chmod 755 /opt/cni/bin /etc/cni/net.d /var/lib/cni/networks /var/lib/calico /var/run/calico
+
+# create a marker file that provisioning completed
+sudo touch /var/vagrant_provision_done
+
+# create helper scripts in /vagrant (shared folder) for manual cluster actions
+cat > /vagrant/init_master.sh <<'INIT'
+#!/bin/bash
+set -eux
+# Run on the master VM to initialize the control plane and write a join script
+MASTER_IP="$1"
+POD_CIDR="${2:-192.168.0.0/16}"
+if [ -z "$MASTER_IP" ]; then
+  echo "Usage: ./init_master.sh <MASTER_IP> [POD_CIDR]"
+  exit 1
+fi
+sudo kubeadm reset -f || true
+sudo kubeadm init --apiserver-advertise-address=${MASTER_IP} --pod-network-cidr=${POD_CIDR} --ignore-preflight-errors=none | tee /vagrant/kubeadm-init.out
+# copy kubeconfig for vagrant user
+mkdir -p /home/vagrant/.kube
+sudo cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+sudo chown vagrant:vagrant /home/vagrant/.kube/config
+# generate join command file
+JOIN_CMD=$(kubeadm token create --print-join-command)
+echo "#!/bin/bash" > /vagrant/join.sh
+echo "# Run this on each worker (as root) to join the cluster" >> /vagrant/join.sh
+echo "sudo ${JOIN_CMD} --ignore-preflight-errors=all" >> /vagrant/join.sh
+chmod +x /vagrant/join.sh
+echo "Created /vagrant/join.sh — copy and run on each worker to join"
+INIT
+chmod +x /vagrant/init_master.sh
+
+# also create a small helper to apply Calico manually
+cat > /vagrant/apply_calico.sh <<'CAL'
+#!/bin/bash
+set -eux
+# Run on master (after kubeadm init finishes) to apply Calico v3.27
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.2/manifests/calico.yaml
+CAL
+chmod +x /vagrant/apply_calico.sh
+
+SHELL
+
+  # MASTER
+  config.vm.define "master" do |master|
+    master.vm.hostname = "master"
+    master.vm.network "private_network", ip: "192.168.56.10"
+    master.vm.provision "shell", inline: common_provision
+  end
+
+  # WORKERS
+  config.vm.define "worker1" do |worker1|
+    worker1.vm.hostname = "worker1"
+    worker1.vm.network "private_network", ip: "192.168.56.11"
+    worker1.vm.provision "shell", inline: common_provision
+  end
+
+  config.vm.define "worker2" do |worker2|
+    worker2.vm.hostname = "worker2"
+    worker2.vm.network "private_network", ip: "192.168.56.12"
+    worker2.vm.provision "shell", inline: common_provision
+  end
+end
